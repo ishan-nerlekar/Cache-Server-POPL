@@ -35,17 +35,17 @@ struct Conn {
 }
 
 fn main() {
-    let matches = App::new("cache-server")
+    let matches = clap::App::new("cache-server")
         .version("v0.0.1")
         .arg(
-            Arg::with_name("threads")
+            clap::Arg::with_name("threads")
                 .help("Sets the number of threads")
                 .short("t")
                 .long("threads")
                 .takes_value(true),
         )
         .arg(
-            Arg::with_name("port")
+            clap::Arg::with_name("port")
                 .help("Sets the listening port")
                 .short("p")
                 .long("port")
@@ -54,31 +54,25 @@ fn main() {
         )
         .get_matches();
 
-    let mut threads = matches
+    let threads = matches
         .value_of("threads")
         .unwrap_or(&num_cpus::get().to_string())
         .parse::<usize>()
-        .unwrap();
-    if threads == 0 { threads = 1 }
+        .unwrap_or_else(|_| num_cpus::get());
 
     let port = matches
         .value_of("port")
         .unwrap_or("6380")
         .parse::<usize>()
-        .unwrap();
+        .unwrap_or(6380);
 
     let addr = format!("0.0.0.0:{}", port);
-    let server = TcpListener::bind(&addr.parse().unwrap()).unwrap();
+    let server = TcpListener::bind(&addr).await.unwrap();
+
     let main_poll = Poll::new().unwrap();
     main_poll
-        .register(&server, Token(0), Ready::readable(), PollOpt::empty())
+        .register(&server, MAIN_POLL_TOKEN, Ready::readable(), mio::PollOpt::edge())
         .unwrap();
-    println!(
-        "Server started on port {} using {} thread{}",
-        port,
-        threads,
-        if threads == 1 { "" } else { "s" }
-    );
 
     let main_conns = Arc::new(Mutex::new(HashMap::new()));
     let store = Arc::new(Mutex::new(Store::new()));
@@ -86,7 +80,7 @@ fn main() {
     let mut child_polls = Vec::new();
     for _ in 0..threads {
         let poll = Poll::new().unwrap();
-        child_polls.push(poll)
+        child_polls.push(poll);
     }
 
     crossbeam::scope(|scope| {
@@ -101,35 +95,39 @@ fn main() {
 
 fn main_loop(
     main_poll: &Poll,
-    child_polls: &Vec<Poll>,
+    child_polls: &[Poll],
     main_conns: Arc<Mutex<HashMap<usize, Conn>>>,
     server: TcpListener,
 ) {
     let mut id = 0;
     let mut events = Events::with_capacity(1);
+
     loop {
         main_poll.poll(&mut events, None).unwrap();
-        events.iter().last().unwrap();
+        let _ = events.iter().last(); // Ignore the result, as it is not used
+
         match server.accept() {
-            Ok(s) => {
-                s.0
+            Ok((stream, addr)) => {
+                stream
                     .set_keepalive(Some(std::time::Duration::from_secs(300)))
                     .unwrap();
+
                 id += 1;
                 let child = &child_polls[id % child_polls.len()];
                 child
                     .register(
-                        &s.0,
+                        &stream,
                         Token(id),
                         Ready::readable() | Ready::writable(),
-                        PollOpt::empty(),
+                        mio::PollOpt::empty(),
                     )
                     .unwrap();
+
                 main_conns.lock().unwrap().insert(
                     id,
                     Conn {
-                        stream: s.0,
-                        addr: s.1,
+                        stream,
+                        addr,
                         close: false,
                         reg_write: false,
                         input: Vec::new(),
@@ -151,184 +149,197 @@ fn child_loop(
     let mut packet = [0; 4096];
     let mut streams: HashMap<usize, Conn> = HashMap::new();
     let mut events = Events::with_capacity(1);
+
     loop {
         child_poll.poll(&mut events, None).unwrap();
         let event = events.iter().last().unwrap();
         let id = event.token().0;
+
         let mut close = false;
         let mut found = false;
+
         if let Some(conn) = streams.get_mut(&id) {
             found = true;
-            loop {
-                if conn.output.len() > 0 {
-                    match (&conn.stream).write(conn.output.as_slice()) {
-                        Ok(n) => {
-                            let mut output = Vec::new();
-                            if n < conn.output.len() {
-                                output.extend_from_slice(&conn.output[n..conn.output.len()]);
-                            }
-                            conn.output = output
-                        }
-                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                        Err(_) => {
-                            close = true;
-                        }
-                    }
-                } else if !conn.close {
-                    match (&conn.stream).read(&mut packet) {
-                        Ok(n) => {
-                            if n == 0 {
-                                close = true;
-                            } else {
-                                conn.input.extend_from_slice(&packet[0..n]);
-                                let (output, close) = event_data(id, &mut conn.input, &store);
-                                conn.output.extend(output);
-                                conn.close = close;
-                                if conn.output.len() > 0 {
-                                    continue;
-                                }
-                            }
-                        }
-                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                        Err(_) => {
-                            close = true;
-                        }
-                    }
-                }
-                break;
-            }
-            if conn.output.len() > 0 {
-                if !conn.reg_write {
-                    conn.reg_write = true;
-                    child_poll
-                        .reregister(
-                            &conn.stream,
-                            Token(id),
-                            Ready::readable() | Ready::writable(),
-                            PollOpt::empty(),
-                        )
-                        .unwrap()
-                }
-            } else {
-                if conn.reg_write {
-                    conn.reg_write = false;
-                    child_poll
-                        .reregister(&conn.stream, Token(id), Ready::readable(), PollOpt::empty())
-                        .unwrap()
-                }
-                if !close {
-                    close = conn.close
-                }
-            }
+            handle_existing_connection(conn, &mut close, &packet, id, &store);
         }
+
         if close {
             streams.remove(&id);
             event_closed(id);
         } else if !found {
-            if let Some(mut conn) = main_conns.lock().unwrap().remove(&id) {
-                let (output, close) = event_opened(id, conn.addr);
-                if output.len() > 0 {
-                    conn.reg_write = true;
-                    conn.close = close;
-                    conn.output = output;
-                    child_poll
-                        .reregister(
-                            &conn.stream,
-                            Token(id),
-                            Ready::writable() | Ready::readable(),
-                            PollOpt::empty(),
-                        )
-                        .unwrap();
-                    streams.insert(id, conn);
-                } else if !close {
-                    child_poll
-                        .reregister(&conn.stream, Token(id), Ready::readable(), PollOpt::empty())
-                        .unwrap();
-                    streams.insert(id, conn);
+            handle_new_connection(id, &mut streams, &main_conns, &child_poll, &store);
+        }
+    }
+}
+
+fn handle_existing_connection(
+    conn: &mut Conn,
+    close: &mut bool,
+    packet: &[u8],
+    id: usize,
+    store: &Arc<Mutex<Store>>,
+) {
+    while conn.output.len() > 0 {
+        match conn.stream.write(conn.output.as_slice()) {
+            Ok(n) => {
+                conn.output = conn.output.split_off(n);
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(_) => {
+                *close = true;
+            }
+        }
+    }
+
+    if !conn.close && conn.output.len() == 0 {
+        match conn.stream.read(&mut packet[..]) {
+            Ok(n) => {
+                if n == 0 {
+                    *close = true;
+                } else {
+                    conn.input.extend_from_slice(&packet[..n]);
+                    let (output, conn_close) = event_data(id, &mut conn.input, store);
+                    conn.output.extend(output);
+                    conn.close = conn_close;
                 }
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(_) => {
+                *close = true;
             }
         }
     }
 }
 
-fn redcon_take_inline_args(packet: &Vec<u8>, ni: usize) -> (Vec<Vec<u8>>, String, usize, bool) {
+fn handle_new_connection(
+    id: usize,
+    streams: &mut HashMap<usize, Conn>,
+    main_conns: &Arc<Mutex<HashMap<usize, Conn>>>,
+    child_poll: &Poll,
+    store: &Arc<Mutex<Store>>,
+) {
+    if let Some(mut conn) = main_conns.lock().unwrap().remove(&id) {
+        let (output, close) = event_opened(id, conn.addr);
+
+        if output.len() > 0 {
+            conn.reg_write = true;
+            conn.close = close;
+            conn.output = output;
+            child_poll
+                .reregister(
+                    &conn.stream,
+                    Token(id),
+                    Ready::writable() | Ready::readable(),
+                    mio::PollOpt::empty(),
+                )
+                .unwrap();
+            streams.insert(id, conn);
+        } else if !close {
+            child_poll
+                .reregister(&conn.stream, Token(id), Ready::readable(), mio::PollOpt::empty())
+                .unwrap();
+            streams.insert(id, conn);
+        }
+    }
+}
+fn redcon_take_inline_args(packet: &[u8], mut ni: usize) -> (Vec<Vec<u8>>, String, usize, bool) {
     let mut i = ni;
     let mut s = ni;
     let mut args: Vec<Vec<u8>> = Vec::new();
+
     while i < packet.len() {
-        if packet[i] == b' ' || packet[i] == b'\n' {
-            let mut ii = i;
-            if packet[i] == b'\n' && i > s && packet[i - 1] == b'\r' {
-                ii = i - 1;
-            }
-            if s != ii {
-                args.push(packet[s..ii].to_vec());
-            }
-            if packet[i] == b'\n' {
-                return (args, String::default(), i + 1, true);
-            }
-            s = i + 1;
-        } else if packet[i] == b'"' || packet[i] == b'\'' {
-            let mut arg = Vec::new();
-            let ch = packet[i];
-            i += 1;
-            s = i;
-            while i < packet.len() {
+        match packet[i] {
+            b' ' | b'\n' => {
+                let mut ii = i;
+                if packet[i] == b'\n' && i > s && packet[i - 1] == b'\r' {
+                    ii = i - 1;
+                }
+                if s != ii {
+                    args.push(packet[s..ii].to_vec());
+                }
                 if packet[i] == b'\n' {
+                    return (args, String::default(), i + 1, true);
+                }
+                s = i + 1;
+            }
+            b'"' | b'\'' => {
+                let (arg, new_i, balanced) = parse_quoted_arg(packet, i + 1);
+                if !balanced {
                     return (
                         Vec::default(),
                         "ERR Protocol error: unbalanced quotes in request".to_string(),
                         ni,
                         false,
                     );
-                } else if packet[i] == b'\\' {
-                    i += 1;
-                    match packet[i] {
-                        b'n' => arg.push(b'\n'),
-                        b'r' => arg.push(b'\r'),
-                        b't' => arg.push(b'\t'),
-                        b'b' => arg.push(0x08),
-                        b'a' => arg.push(0x07),
-                        b'x' => {
-                            let is_hex = |b: u8| -> bool {
-                                (b >= b'0' && b <= b'9') || (b >= b'a' && b <= b'f') ||
-                                    (b >= b'A' && b <= b'F')
-                            };
-                            let hex_to_digit = |b: u8| -> u8 {
-                                if b <= b'9' {
-                                    b - b'0'
-                                } else if b <= b'F' {
-                                    b - b'A' + 10
-                                } else {
-                                    b - b'a' + 10
-                                }
-                            };
-                            if packet.len() - (i + 1) >= 2 && is_hex(packet[i + 1]) &&
-                                is_hex(packet[i + 2])
-                            {
-                                arg.push(
-                                    hex_to_digit(packet[i + 1]) << 4 + hex_to_digit(packet[i + 2]),
-                                );
-                                i += 2
-                            } else {
-                                arg.push(b'x')
-                            }
-                        }
-                        _ => arg.push(packet[i]),
-                    }
-                } else if packet[i] == ch {
-                    args.push(arg);
-                    s = i + 1;
-                    break;
-                } else {
-                    arg.push(packet[i]);
                 }
-                i += 1;
+                args.push(arg);
+                i = new_i;
+                s = i + 1;
             }
+            _ => {}
         }
         i += 1;
     }
+
     (Vec::default(), String::default(), ni, false)
+}
+
+fn parse_quoted_arg(packet: &[u8], mut i: usize) -> (Vec<u8>, usize, bool) {
+    let mut arg = Vec::new();
+    let ch = packet[i - 1];
+
+    while i < packet.len() {
+        match packet[i] {
+            b'\n' => return (Vec::default(), i, false),
+            b'\\' => {
+                i += 1;
+                match packet[i] {
+                    b'n' => arg.push(b'\n'),
+                    b'r' => arg.push(b'\r'),
+                    b't' => arg.push(b'\t'),
+                    b'b' => arg.push(0x08),
+                    b'a' => arg.push(0x07),
+                    b'x' => {
+                        if let Some(value) = parse_hex_byte(packet, i + 1) {
+                            arg.push(value);
+                            i += 2;
+                        } else {
+                            arg.push(b'x');
+                        }
+                    }
+                    _ => arg.push(packet[i]),
+                }
+            }
+            ch if packet[i] == ch => return (arg, i + 1, true),
+            _ => arg.push(packet[i]),
+        }
+        i += 1;
+    }
+
+    (Vec::default(), i, false)
+}
+
+fn parse_hex_byte(packet: &[u8], i: usize) -> Option<u8> {
+    if i + 1 < packet.len() {
+        let is_hex = |b: u8| (b >= b'0' && b <= b'9') || (b >= b'a' && b <= b'f') || (b >= b'A' && b <= b'F');
+        if is_hex(packet[i]) && is_hex(packet[i + 1]) {
+            Some((hex_to_digit(packet[i]) << 4) + hex_to_digit(packet[i + 1]))
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+fn hex_to_digit(b: u8) -> u8 {
+    if b <= b'9' {
+        b - b'0'
+    } else if b <= b'F' {
+        b - b'A' + 10
+    } else {
+        b - b'a' + 10
+    }
 }
 
 fn redcon_take_multibulk_args(input: &Vec<u8>, ni: usize) -> (Vec<Vec<u8>>, String, usize, bool) {
