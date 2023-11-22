@@ -50,21 +50,21 @@ List 5 to 10 key POPL aspects involved in the implementation. Provide specific p
 ### Aspect 1: Ownership and Borrowing:
 Arc (Atomic Reference Counting)
 
-Pointer to Code: [Ownership and Borrowing](https://github.com/ishan-nerlekar/Cache-Server-POPL/blob/main/src/main.rs#L85)
+Pointer to Code: [Ownership and Borrowing](https://github.com/ishan-nerlekar/Cache-Server-POPL/blob/main/src/main.rs#L77)
 - Explanation: main_conns and store are declared as Arc<Mutex<HashMap<usize, Conn>>> and Arc<Mutex<Store>>, respectively. Arc provides shared ownership over its content, and Mutex helps manage concurrent mutable access to the shared data.
 
 ### Aspect 2: References:
 Function Parameters
 
-Pointer to Code: [References](https://github.com/ishan-nerlekar/Cache-Server-POPL/blob/main/src/main.rs#L455)
+Pointer to Code: [References](https://github.com/ishan-nerlekar/Cache-Server-POPL/blob/main/src/main.rs#L464)
 - Explanation: Functions like event_data, handle_command, and others take references (&) to arguments instead of taking ownership of them. This allows them to borrow data for the duration of the function call without taking full ownership. For example, fn event_data(..., store: &Arc<Mutex<Store>>).
 
 ### Aspect 3: Shadowing:
-Pointer to Code: [Shadowing](https://github.com/ishan-nerlekar/Cache-Server-POPL/blob/main/src/main.rs#L59)
+Pointer to Code: [Shadowing](https://github.com/ishan-nerlekar/Cache-Server-POPL/blob/main/src/main.rs#L57)
 - Explanation: In this code snippet, the variable 'threads' is shadowed when it is redefined with a new value. It initially holds the parsed value of the command-line argument, and if the value is not present or invalid, it takes on the value returned by num_cpus::get()
 
 ### Aspect 4: Dangling Pointers:
-Pointer to Code: [Dangling Pointers](https://github.com/ishan-nerlekar/Cache-Server-POPL/blob/main/src/main.rs#L493)
+Pointer to Code: [Dangling Pointers](https://github.com/ishan-nerlekar/Cache-Server-POPL/blob/main/src/main.rs#L502)
 - Explanation: In the event_data function, this code removes processed data from the input vector. It ensures that if i is within the valid bounds of the vector, the data is cleared and, if needed, transferred to a new vector (remain). This approach avoids leaving any dangling pointers to the processed data.
 
 ## 4. Results
